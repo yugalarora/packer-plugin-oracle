@@ -105,54 +105,66 @@ can also be supplied to override the typical auto-generated key:
 Each of the following configuration parameters is either **mandatory** or **unacceptable**
 based on which authentication method is used.
 
-- `use_instance_principals` (boolean) - Whether to use [Instance
-  Principals](https://docs.cloud.oracle.com/en-us/iaas/Content/Identity/Tasks/callingservicesfrominstances.htm)
-  instead of User Principals. If this key is set to true, setting any one of the `access_cfg_file`,
-  `access_cfg_file_account`, `region`, `tenancy_ocid`, `user_ocid`, `key_file`, `fingerprint`,
-  `pass_phrase` parameters will cause an invalid configuration error.
-  Defaults to `false`.
-
 - `access_cfg_file` (string) - The path to the [OCI config
   file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm).
   This parameter is _optional_ when using token-based authentication.
-  This parameter _cannot_ be used along with the `use_instance_principals` key.
+  This parameter _cannot_ be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
   Defaults to `$HOME/.oci/config`.
 
 - `access_cfg_file_account` (string) - The specific account in the [OCI config
   file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm) to use.
   This parameter is _mandatory_ when using token-based authentication.
-  This parameter _cannot_ be used along with the `use_instance_principals` key.
+  This parameter _cannot_ be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
   Defaults to `DEFAULT`.
+
+- `use_instance_principals` (boolean) - Whether to use [Instance
+  Principals](https://docs.cloud.oracle.com/en-us/iaas/Content/Identity/Tasks/callingservicesfrominstances.htm)
+  instead of User Principals. If this key is set to true, setting any one of the `access_cfg_file`,
+  `access_cfg_file_account`, `region`, `tenancy_ocid`, `user_ocid`, `key_file`, `fingerprint`,
+  `pass_phrase`, or `use_resource_principal_token` parameters will cause an invalid configuration error.
+  Defaults to `false`.
+
+- `use_resource_principal_token` (boolean) - If this is set to true, the OCI SDK will use a resource principal token for
+  authentication. This is primarily useful if you are running Packer within an OCI Function or another OCI resource that
+  supports resource principal authentication. This option is mutually exclusive with `use_instance_principals`,
+  `access_cfg_file`, `access_cfg_file_account`, `user_ocid`, `tenancy_ocid`, `region` (the config file parameter, as
+  the region is sourced from an environment variable for this auth method), `fingerprint`, `key_file`, and `pass_phrase`.
+  When `use_resource_principal_token` is true, the following environment variables must be set:
+  `OCI_RESOURCE_PRINCIPAL_VERSION`, `OCI_RESOURCE_PRINCIPAL_RPST`, `OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM`, and
+  `OCI_RESOURCE_PRINCIPAL_REGION`. Defaults to `false`.
 
 
 ### Overriding authentication defaults
 
 The following parameters can be used to override the default value provided by
-or configured for the default OCI CLI authenticaton profile.
+or configured for the default OCI CLI authenticaton profile. These are generally
+not applicable if `use_instance_principals` or `use_resource_principal_token` is set to `true`.
 
 - `region` (string) - An Oracle Cloud Infrastructure region. Overrides value provided by the
   [OCI config file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm)
-  if present. This cannot be used along with the `use_instance_principals` key.
+  if present. This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
+  (Note: For `use_resource_principal_token`, region is sourced from the `OCI_RESOURCE_PRINCIPAL_REGION` environment variable).
 
 - `tenancy_ocid` (string) - The OCID of your tenancy. Overrides value provided by the [OCI config
   file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm) if present.
-  This cannot be used along with the `use_instance_principals` key.
+  This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
 
 - `user_ocid` (string) - The OCID of the user calling the OCI API. Overrides value provided by the
   [OCI config file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm)
-  if present. This cannot be used along with the `use_instance_principals` key.
+  if present. This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
 
 - `key_file` (string) - Full path and filename of the OCI API signing key. Overrides value provided
   by the [OCI config file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm)
-  if present. This cannot be used along with the `use_instance_principals` key.
+  if present. This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
+  (Note: For `use_resource_principal_token`, the key is sourced from the `OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM` environment variable).
 
 - `fingerprint` (string) - Fingerprint for the OCI API signing key. Overrides value provided by the
   [OCI config file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm) if
-  present. This cannot be used along with the `use_instance_principals` key.
+  present. This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
 
 - `pass_phrase` (string) - Pass phrase used to decrypt the OCI API signing key. Overrides value provided
   by the [OCI config file](https://docs.us-phoenix-1.oraclecloud.com/Content/API/Concepts/sdkconfig.htm)
-  if present. This cannot be used along with the `use_instance_principals` key.
+  if present. This cannot be used along with the `use_instance_principals` or `use_resource_principal_token` keys.
 
   ### Additional configuration parameters
 

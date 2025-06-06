@@ -79,6 +79,12 @@ type Config struct {
 	// - PassPhrase
 	InstancePrincipals bool `mapstructure:"use_instance_principals"`
 
+	// Resource Principal Token (OPTIONAL)
+	// If set to true, the OCI SDK will use resource principal token for authentication.
+	// This is useful if you are running Packer within an OCI Function.
+	// This option is mutually exclusive with use_instance_principals and other credential-specific configurations.
+	UseResourcePrincipalToken bool `mapstructure:"use_resource_principal_token" required:"false"`
+
 	// If true, Packer will not create the image. Useful for setting to `true`
 	// during a build test stage. Default `false`.
 	SkipCreateImage bool `mapstructure:"skip_create_image" required:"false"`
@@ -187,12 +193,116 @@ func (c *Config) Prepare(raws ...interface{}) error {
 
 	var tenancyOCID string
 
+	// Determine active authentication method and check for mutual exclusivity
+	authMethods := 0
 	if c.InstancePrincipals {
+		authMethods++
+	}
+	if c.UseResourcePrincipalToken {
+		authMethods++
+	}
+
+	// Check if any standard auth parameters are set, which would imply a third auth method.
+	// This is a simplified check; detailed conflicts are handled within each auth method's block.
+	hasStandardAuthConfig := c.AccessCfgFile != "" || c.AccessCfgFileAccount != "" ||
+		c.UserID != "" || c.TenancyID != "" || c.Region != "" ||
+		c.Fingerprint != "" || c.KeyFile != "" || c.PassPhrase != "" || c.SecurityTokenFilePath != ""
+
+	if !c.InstancePrincipals && !c.UseResourcePrincipalToken && hasStandardAuthConfig {
+		authMethods++
+	} else if (c.InstancePrincipals || c.UseResourcePrincipalToken) && hasStandardAuthConfig {
+		// If using principal auth AND standard auth fields are set, it's a conflict handled below.
+		// No need to increment authMethods here as it's covered by specific checks.
+	}
+
+
+	if authMethods > 1 {
+		errs = packersdk.MultiErrorAppend(errs, errors.New("Configuration error: 'use_instance_principals', 'use_resource_principal_token', and standard credential configurations (e.g., 'user_ocid', 'key_file') are mutually exclusive. Please use only one authentication method."))
+		// No need to proceed with auth provider setup if multiple methods are ambiguously implied.
+	} else if c.UseResourcePrincipalToken {
+		// Resource Principal Token Authentication
+		var message string = " cannot be present when use_resource_principal_token is set to true."
+		if c.InstancePrincipals { // Explicit check against InstancePrincipals
+			errs = packersdk.MultiErrorAppend(errs, errors.New("'use_instance_principals'"+message))
+		}
+		if c.AccessCfgFile != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("access_cfg_file"+message))
+		}
+		if c.AccessCfgFileAccount != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("access_cfg_file_account"+message))
+		}
+		if c.UserID != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("user_ocid"+message))
+		}
+		if c.TenancyID != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("tenancy_ocid"+message))
+		}
+		if c.Region != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("region"+message+" (use OCI_RESOURCE_PRINCIPAL_REGION environment variable)"))
+		}
+		if c.Fingerprint != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("fingerprint"+message))
+		}
+		if c.KeyFile != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("key_file"+message+" (use OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM environment variable)"))
+		}
+		if c.PassPhrase != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("pass_phrase"+message))
+		}
+		if c.SecurityTokenFilePath != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("security_token_file"+message+" (use OCI_RESOURCE_PRINCIPAL_RPST environment variable)"))
+		}
+
+		requiredEnvVars := []string{
+			"OCI_RESOURCE_PRINCIPAL_VERSION",
+			"OCI_RESOURCE_PRINCIPAL_RPST",
+			"OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM",
+			"OCI_RESOURCE_PRINCIPAL_REGION",
+		}
+		for _, envVar := range requiredEnvVars {
+			if os.Getenv(envVar) == "" {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Required environment variable %s is not set for Resource Principal Token authentication", envVar))
+			}
+		}
+
+		// Attempt to create provider only if no previous errors related to RPT config
+		if c.configProvider == nil && len(errs.Errors) == 0 { // Only attempt if no prior errors
+			provider, err := ociauth.ResourcePrincipalConfigurationProvider()
+			if err != nil {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Failed to create Resource Principal Configuration Provider: %w", err))
+			} else if provider == nil { // New check
+				errs = packersdk.MultiErrorAppend(errs, errors.New("Resource principal configuration provider returned nil without an error"))
+			} else {
+				c.configProvider = provider
+				// TenancyOCID might be needed for some validations later, try to get it
+				// It's okay if it fails here, as the provider itself is the primary goal
+				currentTenancyOCID, errTenancy := provider.TenancyOCID()
+				if errTenancy != nil {
+					// Log or handle error if TenancyOCID is critical for RP flow immediately
+					// For now, consistent with previous logic, we don't make this a hard error for errs
+					log.Printf("[WARN] Could not get TenancyOCID from resource principal provider: %v", errTenancy)
+				} else if currentTenancyOCID == "" {
+					log.Printf("[WARN] Resource principal provider returned an empty TenancyOCID.")
+				}
+				// Assign to tenancyOCID only if it's successfully retrieved for later validation/use
+				// This ensures tenancyOCID variable is only populated with a valid, non-empty string.
+				if currentTenancyOCID != "" {
+					tenancyOCID = currentTenancyOCID
+				}
+				// Set region from env var if not set by provider (should be set by env for RPT)
+				if c.Region == "" && os.Getenv("OCI_RESOURCE_PRINCIPAL_REGION") != "" {
+					c.Region = os.Getenv("OCI_RESOURCE_PRINCIPAL_REGION")
+				}
+			}
+		}
+	} else if c.InstancePrincipals {
+		// Instance Principals Authentication
 		// We could go through all keys in one go and report that the below set
 		// of keys cannot coexist with use_instance_principals but decided to
 		// split them and report them seperately so that the user sees the specific
 		// key involved.
 		var message string = " cannot be present when use_instance_principals is set to true."
+		// This block needs to ensure mutual exclusivity with standard auth parameters
 		if c.AccessCfgFile != "" {
 			errs = packersdk.MultiErrorAppend(errs, errors.New("access_cfg_file"+message))
 		}
@@ -217,30 +327,52 @@ func (c *Config) Prepare(raws ...interface{}) error {
 		if c.PassPhrase != "" {
 			errs = packersdk.MultiErrorAppend(errs, errors.New("pass_phrase"+message))
 		}
-		// This check is used to facilitate testing. During testing a Mock struct
-		// is assigned to c.configProvider otherwise testing fails because Instance
-		// Principals cannot be obtained.
-		if c.configProvider == nil {
-			// Even though the previous configuraion checks might fail we don't want
-			// to skip this step. It seems that the logic behind the checks in this
-			// file is to check everything even getting the configProvider.
-			c.configProvider, err = ociauth.InstancePrincipalConfigurationProvider()
+		if c.SecurityTokenFilePath != "" {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("security_token_file"+message))
+		}
+
+		// Attempt to create provider only if no previous errors related to InstancePrincipals config
+		if len(errs.Errors) == 0 && c.configProvider == nil {
+			provider, err := ociauth.InstancePrincipalConfigurationProvider()
 			if err != nil {
-				return err
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Failed to create Instance Principal Configuration Provider: %w", err))
+			} else {
+				c.configProvider = provider
+				currentTenancyOCID, err := provider.TenancyOCID()
+				if err != nil {
+					errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Failed to get TenancyOCID from Instance Principal: %w", err))
+				} else if currentTenancyOCID == "" {
+					errs = packersdk.MultiErrorAppend(errs, errors.New("TenancyOCID not found via Instance Principal"))
+				} else {
+					tenancyOCID = currentTenancyOCID
+				}
+				// Set region from provider if not set
+				if c.Region == "" {
+					currentRegion, _ := provider.Region()
+					if currentRegion != "" {
+						c.Region = currentRegion
+					}
+				}
 			}
 		}
-		tenancyOCID, err = c.configProvider.TenancyOCID()
-		if err != nil {
-			return err
-		}
-	} else {
+	} else if authMethods == 0 || hasStandardAuthConfig { // Standard Authentication (file, explicit config, or SDK environment variables)
+		// This block executes if no principal auth is set, or if principal auth is set but also standard auth fields (error handled above or by SDK).
+		// Or if authMethods is 0, meaning we default to standard.
 		// Determine where the SDK config is located
 		if c.AccessCfgFile == "" {
-			c.AccessCfgFile, err = getDefaultOCISettingsPath()
-			if err != nil {
-				log.Println("Default OCI settings file not found")
+			defaultPath, defaultPathErr := getDefaultOCISettingsPath()
+			if defaultPathErr == nil {
+				c.AccessCfgFile = defaultPath
+			} else {
+				// Only log if it's not a simple "not found" for the default path,
+				// or if other auth methods aren't being tried.
+				// If explicit user/tenancy/etc. are given, not finding default oci config is fine.
+				if !(c.UserID != "" && c.TenancyID != "" && c.KeyFile != "" && c.Fingerprint != "") {
+					log.Println("Default OCI settings file not found and not all direct auth parameters provided. Relying on SDK environment variables or other auth methods if configured.")
+				}
 			}
 		}
+
 
 		if c.AccessCfgFileAccount == "" {
 			c.AccessCfgFileAccount = "DEFAULT"
@@ -248,71 +380,120 @@ func (c *Config) Prepare(raws ...interface{}) error {
 
 		var keyContent []byte
 		if c.KeyFile != "" {
-			path, err := pathing.ExpandUser(c.KeyFile)
-			if err != nil {
-				return err
-			}
-
-			// Read API signing key
-			keyContent, err = ioutil.ReadFile(path)
-			if err != nil {
-				return err
+			expandedPath, pathErr := pathing.ExpandUser(c.KeyFile)
+			if pathErr != nil {
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error expanding KeyFile path %s: %w", c.KeyFile, pathErr))
+			} else {
+				var readErr error
+				keyContent, readErr = ioutil.ReadFile(expandedPath)
+				if readErr != nil {
+					errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error reading KeyFile %s: %w", expandedPath, readErr))
+				}
 			}
 		}
 
-		fileProvider, _ := ocicommon.ConfigurationProviderFromFileWithProfile(c.AccessCfgFile, c.AccessCfgFileAccount, c.PassPhrase)
+		var fileProvider ocicommon.ConfigurationProvider
+		if c.AccessCfgFile != "" {
+			// Check if AccessCfgFile actually exists before trying to load it
+			if _, statErr := os.Stat(c.AccessCfgFile); statErr == nil {
+				// PassPhrase might be empty, which is fine for ConfigurationProviderFromFileWithProfile
+				fileProvider, _ = ocicommon.ConfigurationProviderFromFileWithProfile(c.AccessCfgFile, c.AccessCfgFileAccount, c.PassPhrase)
+			} else if !os.IsNotExist(statErr) {
+				// Log error if it's not a "file does not exist" type of error
+				errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Error accessing OCI config file %s: %w", c.AccessCfgFile, statErr))
+			}
+		}
+
+		// Prefer explicitly set region, then from file, then from env, then default
 		if c.Region == "" {
-			var region string
 			if fileProvider != nil {
-				region, _ = fileProvider.Region()
+				regionFromFile, _ := fileProvider.Region()
+				if regionFromFile != "" {
+					c.Region = regionFromFile
+				}
 			}
-			if region == "" {
-				c.Region = "us-phoenix-1"
+			if c.Region == "" && os.Getenv("OCI_REGION") != "" {
+				c.Region = os.Getenv("OCI_REGION")
+			}
+			if c.Region == "" && os.Getenv("OCI_CONFIG_FILE") == "" && c.AccessCfgFile == "" { // Only default if no other region source from file/env
+				c.Region = "us-phoenix-1" // Default if not found anywhere else
 			}
 		}
+		
+		// Create a raw provider from explicitly set config values
+		rawProvider := ocicommon.NewRawConfigurationProvider(c.TenancyID, c.UserID, c.Region, c.Fingerprint, string(keyContent), &c.PassPhrase)
 
-		providers := []ocicommon.ConfigurationProvider{
-			ocicommon.NewRawConfigurationProvider(c.TenancyID, c.UserID, c.Region, c.Fingerprint, string(keyContent), &c.PassPhrase),
-		}
-
+		providers := []ocicommon.ConfigurationProvider{rawProvider}
 		if fileProvider != nil {
 			providers = append(providers, fileProvider)
 		}
+		providers = append(providers, ocicommon.DefaultConfigProvider()) // Checks environment variables
 
-		// Load API access configuration from SDK
-		configProvider, err := ocicommon.ComposingConfigurationProvider(providers)
-		if err != nil {
-			return err
+		composedProvider, compErr := ocicommon.ComposingConfigurationProvider(providers)
+		if compErr != nil {
+			errs = packersdk.MultiErrorAppend(errs, fmt.Errorf("Failed to create Composing Configuration Provider: %w", compErr))
+		} else {
+			c.configProvider = composedProvider
 		}
 
-		tenancyOCID, _ = configProvider.TenancyOCID()
-		if tenancyOCID == "" {
-			errs = packersdk.MultiErrorAppend(
-				errs, errors.New("'tenancy_ocid' must be specified"))
-		}
+		// Validate essential fields if using standard auth and provider was successfully created
+		if c.configProvider != nil {
+			currentTenancyID, err := c.configProvider.TenancyOCID()
+			if err != nil || currentTenancyID == "" {
+				errs = packersdk.MultiErrorAppend(errs, errors.New("tenancy_ocid must be specified (config, OCI config file, or OCI_TENANCY env var)"))
+			} else {
+				tenancyOCID = currentTenancyID // Used for defaulting CompartmentID
+			}
 
-		if fingerprint, _ := configProvider.KeyFingerprint(); fingerprint == "" {
-			errs = packersdk.MultiErrorAppend(
-				errs, errors.New("'fingerprint' must be specified"))
-		}
+			// Region check (critical for API calls)
+			currentRegion, err := c.configProvider.Region()
+			if err != nil || currentRegion == "" {
+				errs = packersdk.MultiErrorAppend(errs, errors.New("region must be specified (config, OCI config file, OCI_REGION env var, or default)"))
+			} else {
+				c.Region = currentRegion // Ensure c.Region is updated from provider if it resolved one
+			}
 
-		if _, err := configProvider.UserOCID(); err != nil {
-			errs = packersdk.MultiErrorAppend(
-				errs, fmt.Errorf("'user_ocid' must be correctly specified. %w", err))
+			// Fingerprint and UserOCID are generally required if not using session token auth
+			// The SDK's DefaultConfigProvider handles session tokens (OCI_SECURITY_TOKEN_FILE, OCI_AUTH_TOKEN_FILE)
+			// So, these checks are conditional. If these are empty, the SDK might still succeed with a token.
+			// We rely on actual API calls to fail if auth is truly broken.
+			// However, if KeyFile is provided, Fingerprint is expected.
+			if c.KeyFile != "" {
+				if fp, _ := c.configProvider.KeyFingerprint(); fp == "" {
+					errs = packersdk.MultiErrorAppend(errs, errors.New("fingerprint must be specified when 'key_file' is provided (config, OCI config file, or OCI_FINGERPRINT env var)"))
+				}
+			}
+			if user, _ := c.configProvider.UserOCID(); user == "" && (c.KeyFile != "" || c.Fingerprint != "") { // If key/fingerprint implies API key auth
+				errs = packersdk.MultiErrorAppend(errs, errors.New("user_ocid must be specified for API key auth (config, OCI config file, or OCI_USER env var)"))
+			}
 		}
-
-		if _, err := configProvider.KeyID(); err != nil {
-			errs = packersdk.MultiErrorAppend(
-				errs, fmt.Errorf("'security_token_file' must be correctly specified. %w", err))
-		}
-
-		if _, err := configProvider.PrivateRSAKey(); err != nil {
-			errs = packersdk.MultiErrorAppend(
-				errs, fmt.Errorf("'key_file' must be correctly specified. %w", err))
-		}
-
-		c.configProvider = configProvider
 	}
+
+
+	// Final check for provider
+	if c.configProvider == nil && len(errs.Errors) == 0 { // if no errors so far, but provider is still nil
+		errs = packersdk.MultiErrorAppend(errs, errors.New("Could not initialize OCI configuration provider. Please check your authentication settings."))
+	}
+
+
+	// Common validations that rely on tenancyOCID or region being determined
+	if tenancyOCID == "" && c.configProvider != nil && len(errs.Errors) == 0 { // Try to get tenancyOCID again if not set
+		currentTenancyOCID, err := c.configProvider.TenancyOCID()
+		if err == nil && currentTenancyOCID != "" {
+			tenancyOCID = currentTenancyOCID
+		} else if len(errs.Errors) == 0 { // Avoid adding redundant error if auth already failed
+			errs = packersdk.MultiErrorAppend(errs, errors.New("Could not determine Tenancy OCID from any authentication method."))
+		}
+	}
+	if c.Region == "" && c.configProvider != nil && len(errs.Errors) == 0 { // Try to get region again
+		currentRegion, err := c.configProvider.Region()
+		if err == nil && currentRegion != "" {
+			c.Region = currentRegion
+		} else if len(errs.Errors) == 0 {
+			errs = packersdk.MultiErrorAppend(errs, errors.New("Could not determine Region from any authentication method."))
+		}
+	}
+
 
 	if c.AvailabilityDomain == "" {
 		errs = packersdk.MultiErrorAppend(
@@ -477,3 +658,4 @@ func getDefaultOCISettingsPath() (string, error) {
 
 	return path, nil
 }
+
